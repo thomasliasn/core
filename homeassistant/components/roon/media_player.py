@@ -10,11 +10,14 @@ import voluptuous as vol
 
 from homeassistant.components.media_player import (
     BrowseMedia,
+    MediaClass,
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
     MediaPlayerState,
     MediaType,
     RepeatMode,
+    SearchMedia,
+    SearchMediaQuery,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import DEVICE_DEFAULT_NAME
@@ -30,7 +33,7 @@ from homeassistant.util import convert
 from homeassistant.util.dt import utcnow
 
 from .const import DOMAIN
-from .media_browser import browse_media
+from .media_browser import browse_media, create_path_id, parse_path_id
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -104,6 +107,7 @@ class RoonDevice(MediaPlayerEntity):
         | MediaPlayerEntityFeature.VOLUME_MUTE
         | MediaPlayerEntityFeature.PLAY
         | MediaPlayerEntityFeature.PLAY_MEDIA
+        | MediaPlayerEntityFeature.SEARCH_MEDIA
     )
 
     def __init__(self, server, player_data, entry_id):
@@ -433,9 +437,23 @@ class RoonDevice(MediaPlayerEntity):
         """Send the play_media command to the media player."""
 
         _LOGGER.debug("Playback request for %s / %s", media_type, media_id)
+        
         if media_type in ("library", "track"):
-            # media_id is a roon browser id
-            self._server.roonapi.play_id(self.zone_id, media_id)
+            # Check if this is a path-based ID from our search results
+            if media_id.startswith("path:"):
+                # Format: "path:category/title" - convert to path list
+                path_list = parse_path_id(media_id)
+                
+                _LOGGER.debug("Playing via path: %s", path_list)
+                success = self._server.roonapi.play_media(self.zone_id, path_list)
+                
+                if not success:
+                    _LOGGER.error("Path-based playback failed for %s", path_list)
+                else:
+                    _LOGGER.debug("Path-based playback successful for %s", path_list)
+            else:
+                # Legacy item_key or other format
+                self._server.roonapi.play_id(self.zone_id, media_id)
         else:
             # media_id is a path matching the Roon menu structure
             path_list = split_media_path(media_id)
@@ -446,6 +464,7 @@ class RoonDevice(MediaPlayerEntity):
                     media_id,
                     path_list,
                 )
+    
 
     def join_players(self, group_members: list[str]) -> None:
         """Join `group_members` as a player group with the current player."""
@@ -542,3 +561,151 @@ class RoonDevice(MediaPlayerEntity):
             media_content_type,
             media_content_id,
         )
+
+    async def async_search_media(self, query: SearchMediaQuery) -> SearchMedia:
+        """Search for media in Roon library."""
+        return await self.hass.async_add_executor_job(
+            self._search_roon_library,
+            query,
+        )
+
+    def _search_roon_library(self, query: SearchMediaQuery) -> SearchMedia:
+        """Search Roon library using browse API."""
+        search_query = query.search_query
+        
+        _LOGGER.debug("Searching for '%s' across Library, Playlists, and Genres", search_query)
+        
+        results = []
+        
+        try:
+            # Get the root level items
+            opts = {
+                "hierarchy": "browse",
+                "zone_or_output_id": self.zone_id,
+                "pop_all": True,
+                "count": 10000,
+            }
+            
+            browse_result = self._server.roonapi.browse_browse(opts)
+            _LOGGER.debug("Search browse result: %s", browse_result)
+            
+            if "InvalidItemKey" in str(browse_result):
+                _LOGGER.warning("Search session invalid, trying fresh session")
+                # Try again with fresh session
+                self._server.roonapi.browse_browse(opts)
+                
+            load_result = self._server.roonapi.browse_load(opts)
+            _LOGGER.debug("Search load result type: %s", type(load_result))
+            
+            if "InvalidItemKey" in str(load_result):
+                _LOGGER.error("Search failed with InvalidItemKey, returning empty results")
+                return SearchMedia(result=[])
+                
+            root_items = load_result["items"]
+            
+            _LOGGER.debug("Root level items: %s", [item.get("title") for item in root_items])
+            
+            # Search categories to check
+            categories_to_search = ["Library", "Playlists", "Genres"]
+            
+            for category_name in categories_to_search:
+                # Find the category item
+                category_item = None
+                for item in root_items:
+                    if item.get("title") == category_name:
+                        category_item = item
+                        break
+                
+                if not category_item:
+                    _LOGGER.debug("Category '%s' not found in root items: %s", category_name, [item.get("title") for item in root_items])
+                    continue
+                
+                _LOGGER.debug("Searching in category: %s", category_name)
+                
+                if category_name == "Library":
+                    # For Library, we need to search within its subcategories
+                    lib_results = self._search_library_subcategories_path_based(search_query)
+                    _LOGGER.debug("Library search returned %d results", len(lib_results))
+                    results.extend(lib_results)
+                else:
+                    # For Playlists and Genres, search directly using path-based navigation
+                    cat_results = self._search_category_items_path_based(category_name, search_query)
+                    _LOGGER.debug("Category %s search returned %d results", category_name, len(cat_results))
+                    results.extend(cat_results)
+                
+                # Limit total results
+                if len(results) >= 100:
+                    break
+            
+            _LOGGER.debug("Found %d total results for '%s'", len(results), search_query)
+            
+        except Exception as err:
+            _LOGGER.error("Error searching Roon library: %s", err)
+            
+        _LOGGER.debug("Search completed: returning %d results for query '%s'", len(results), search_query)
+        return SearchMedia(result=results)
+    
+
+    def _search_library_subcategories_path_based(self, search_query: str) -> list[BrowseMedia]:
+        """Search within Library subcategories using path-based navigation."""
+        results = []
+        
+        # Search within Library subcategories (Artists, Albums, Tracks, etc.)
+        library_categories = ["Artists", "Albums", "Tracks", "Composers"]
+        
+        for subcategory_name in library_categories:
+            _LOGGER.debug("Searching Library/%s using path-based navigation", subcategory_name)
+            cat_results = self._search_category_items_path_based(f"Library/{subcategory_name}", search_query)
+            _LOGGER.debug("Library/%s returned %d results", subcategory_name, len(cat_results))
+            results.extend(cat_results)
+            
+            # Limit results per subcategory
+            if len(results) >= 50:
+                break
+        
+        return results
+
+    def _search_category_items_path_based(self, category_path: str, search_query: str) -> list[BrowseMedia]:
+        """Search items within a category using path-based navigation."""
+        results = []
+        
+        try:
+            # Use the working path_based_browse function from media_browser
+            from .media_browser import path_based_browse
+            
+            path_id = create_path_id(category_path.split("/"))
+            _LOGGER.debug("Searching category using path: %s", path_id)
+            
+            # Get the category contents using path-based browsing
+            browse_result = path_based_browse(self._server, self.zone_id, path_id)
+            
+            if not browse_result or not browse_result.children:
+                _LOGGER.debug("No items found in category %s", category_path)
+                return []
+            
+            # Filter items based on search query
+            query_lower = search_query.lower()
+            
+            for child in browse_result.children:
+                title = child.title or ""
+                
+                # Search in title (remove category prefix if present)
+                clean_title = title
+                if title.startswith("["):
+                    # Remove category prefix like "[Library/Artists] The Beatles"
+                    clean_title = title.split("] ", 1)[-1] if "] " in title else title
+                
+                if (query_lower in clean_title.lower() or search_query == "__all__"):
+                    # Use the existing child object which already has proper path-based ID
+                    results.append(child)
+                    
+                    # Limit results per category
+                    if len(results) >= 25:
+                        break
+            
+            _LOGGER.debug("Found %d matching results in %s", len(results), category_path)
+            return results
+            
+        except Exception as err:
+            _LOGGER.error("Error in path-based search for %s: %s", category_path, err)
+            return []
