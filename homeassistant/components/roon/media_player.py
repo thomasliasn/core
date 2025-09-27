@@ -452,7 +452,7 @@ class RoonDevice(MediaPlayerEntity):
                 else:
                     _LOGGER.debug("Path-based playback successful for %s", path_list)
             else:
-                # Legacy item_key or other format
+                # Other format (e.g., direct Roon item ID)
                 self._server.roonapi.play_id(self.zone_id, media_id)
         else:
             # media_id is a path matching the Roon menu structure
@@ -586,21 +586,8 @@ class RoonDevice(MediaPlayerEntity):
                 "count": 10000,
             }
             
-            browse_result = self._server.roonapi.browse_browse(opts)
-            _LOGGER.debug("Search browse result: %s", browse_result)
-            
-            if "InvalidItemKey" in str(browse_result):
-                _LOGGER.warning("Search session invalid, trying fresh session")
-                # Try again with fresh session
-                self._server.roonapi.browse_browse(opts)
-                
+            self._server.roonapi.browse_browse(opts)
             load_result = self._server.roonapi.browse_load(opts)
-            _LOGGER.debug("Search load result type: %s", type(load_result))
-            
-            if "InvalidItemKey" in str(load_result):
-                _LOGGER.error("Search failed with InvalidItemKey, returning empty results")
-                return SearchMedia(result=[])
-                
             root_items = load_result["items"]
             
             _LOGGER.debug("Root level items: %s", [item.get("title") for item in root_items])

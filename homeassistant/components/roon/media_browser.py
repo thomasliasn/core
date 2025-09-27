@@ -92,16 +92,11 @@ def browse_media(zone_id, roon_server, media_content_type=None, media_content_id
 def library_payload(roon_server, zone_id, media_content_id):
     """Create response payload for the library using path-based navigation."""
     
-    # Determine if this is a path-based content ID or legacy
+    # Use path-based navigation for all content IDs
     if media_content_id and media_content_id.startswith("path:"):
         return path_based_browse(roon_server, zone_id, media_content_id)
     
-    # For any non-path ID (including legacy item keys), always show root level
-    if media_content_id and not media_content_id.startswith("path:"):
-        _LOGGER.warning("Invalid or legacy item key '%s', showing root instead", media_content_id)
-    
-    # Always show root browsing for non-path IDs
-    current_path = ""
+    # Show root browsing for None or empty content IDs
     display_title = "Roon Music Library"
     
     # Fresh root level browsing with path-based results
@@ -180,22 +175,12 @@ def path_based_browse(roon_server, zone_id, path_content_id):
         
         # Reset and get root items
         try:
-            browse_result = roon_server.roonapi.browse_browse(opts)
-            if "InvalidItemKey" in str(browse_result):
-                _LOGGER.warning("Browse session invalid, falling back to root")
-                return library_payload(roon_server, zone_id, None)
-            
+            roon_server.roonapi.browse_browse(opts)
             load_result = roon_server.roonapi.browse_load(opts)
-            if "InvalidItemKey" in str(load_result):
-                _LOGGER.warning("Load session invalid, falling back to root")
-                return library_payload(roon_server, zone_id, None)
-            
             current_items = load_result["items"]
         except Exception as err:
-            if "InvalidItemKey" in str(err):
-                _LOGGER.warning("Session invalid during initial browse, falling back to root")
-                return library_payload(roon_server, zone_id, None)
-            raise
+            _LOGGER.error("Failed to get root items for path navigation: %s", err)
+            raise BrowseError("Could not access Roon library for path navigation") from err
         
         # Navigate through each part of the path
         for i, path_part in enumerate(path_parts):
@@ -221,22 +206,12 @@ def path_based_browse(roon_server, zone_id, path_content_id):
                     "count": ITEM_LIMIT,
                 }
                 try:
-                    browse_result = roon_server.roonapi.browse_browse(navigate_opts)
-                    if "InvalidItemKey" in str(browse_result):
-                        _LOGGER.warning("Item key became invalid during intermediate navigation, falling back to root")
-                        return library_payload(roon_server, zone_id, None)
-                    
+                    roon_server.roonapi.browse_browse(navigate_opts)
                     load_result = roon_server.roonapi.browse_load(navigate_opts)
-                    if "InvalidItemKey" in str(load_result):
-                        _LOGGER.warning("Item key became invalid during intermediate load, falling back to root")
-                        return library_payload(roon_server, zone_id, None)
-                    
                     current_items = load_result["items"]
                 except Exception as err:
-                    if "InvalidItemKey" in str(err):
-                        _LOGGER.warning("Item key became invalid during navigation, falling back to root")
-                        return library_payload(roon_server, zone_id, None)
-                    raise
+                    _LOGGER.error("Navigation failed at path part '%s': %s", path_part, err)
+                    raise BrowseError(f"Could not navigate to: {path_part}") from err
             else:
                 # This is the target item - browse into it to show its contents
                 target_opts = {
@@ -249,11 +224,6 @@ def path_based_browse(roon_server, zone_id, path_content_id):
                 result_header = roon_server.roonapi.browse_browse(target_opts)
                 
                 if not isinstance(result_header, dict) or "list" not in result_header:
-                    # Check if this is an InvalidItemKey error
-                    if "InvalidItemKey" in str(result_header):
-                        _LOGGER.warning("Item key became invalid during navigation to %s, falling back to root", path_content_id)
-                        # Fall back to showing root instead of failing
-                        return library_payload(roon_server, zone_id, None)
                     _LOGGER.error("Invalid browse result: %s", result_header)
                     raise BrowseError(f"Could not browse into: {path_part}")
                 
@@ -274,11 +244,6 @@ def path_based_browse(roon_server, zone_id, path_content_id):
                 result_detail = roon_server.roonapi.browse_load(target_opts)
                 
                 if not isinstance(result_detail, dict) or "items" not in result_detail:
-                    # Check if this is an InvalidItemKey error
-                    if "InvalidItemKey" in str(result_detail):
-                        _LOGGER.warning("Item key became invalid during load for %s, falling back to root", path_content_id)
-                        # Fall back to showing root instead of failing
-                        return library_payload(roon_server, zone_id, None)
                     _LOGGER.error("Invalid browse load result: %s", result_detail)
                     raise BrowseError(f"Could not load content for: {path_part}")
                 
