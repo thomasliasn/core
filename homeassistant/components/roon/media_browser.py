@@ -228,6 +228,9 @@ def path_based_browse(roon_server, zone_id, path_content_id):
                     raise BrowseError(f"Could not browse into: {path_part}")
                 
                 header = result_header["list"]
+                if not isinstance(header, dict):
+                    _LOGGER.error("Invalid list header: %s", header)
+                    raise BrowseError(f"Invalid list format for: {path_part}")
                 title = header.get("title", path_part)
                 
                 library_info = BrowseMedia(
